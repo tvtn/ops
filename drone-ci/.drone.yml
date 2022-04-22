@@ -1,0 +1,155 @@
+workspace:
+  base: /build
+
+pipeline:
+
+  build-image:
+    image: docker
+    commands:
+      # Build development target, which includes xdebug.
+      # Tag with both api-build:<build_number> and api-build:latest.
+      # The <build_number> tag will be removed after the build
+      # and the latest tag will stay as a cache.
+      - docker build . --target development -t api-build:${DRONE_BUILD_NUMBER} -t api-build:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  seed-db:
+    image: "api-build:${DRONE_BUILD_NUMBER}"
+    group: parallel-1
+    environment:
+      - DATABASE_USER=root
+      - DATABASE_PASSWORD=msyql
+      - DATABASE_HOST=mysql
+      - DATABASE_NAME=(snip)
+    commands:
+      # Wait for the mysql service to be ready.
+      - while (! mysqladmin ping -hmysql --silent); do sleep 1; done
+      # Seed database with initial data.
+      - composer run seed-db
+
+  build:
+    image: "api-build:${DRONE_BUILD_NUMBER}"
+    group: parallel-1
+    volumes:
+      - composer-cache:/root/.composer
+    commands:
+      # Install dependencies.
+      - composer install --no-interaction --no-progress --no-suggest
+
+  generate-swagger:
+    image: "api-build:${DRONE_BUILD_NUMBER}"
+    environment:
+      - DATABASE_USER=root
+      - DATABASE_PASSWORD=msyql
+      - DATABASE_HOST=mysql
+      - DATABASE_NAME=(snip)
+    commands:
+      # Generate swagger.json.
+      - composer run swagger-generate
+
+  validate-swagger:
+    image: "node:alpine"
+    group: parallel-2
+    volumes:
+      - npm-cache:/root/.npm
+    commands:
+      # Install swagger validator and validate swagger.json
+      - "npm install -g swagger-cli"
+      - "swagger-cli validate ./swagger.json"
+
+  sniff:
+    image: "api-build:${DRONE_BUILD_NUMBER}"
+    group: parallel-2
+    commands:
+      - "composer run sniff"
+
+  test:
+    image: "api-build:${DRONE_BUILD_NUMBER}"
+    group: parallel-2
+    environment:
+      - DATABASE_USER=root
+      - DATABASE_PASSWORD=msyql
+      - DATABASE_HOST=mysql
+      - DATABASE_NAME=(snip)
+    secrets:
+      - source: meraki_api_key
+        target: MERAKI_API_KEY
+    commands:
+      # This php.ini contains settings to disable html_errors and to enable apcu for cli.
+      - cp container/php.ini /etc/php7/php.ini
+      # The tests read the meraki key from a file.
+      - echo $MERAKI_API_KEY > tests/meraki_api_key.txt
+      # Run the tests.
+      - composer run test
+
+  sonarqube:
+    image: newtmitch/sonar-scanner
+    group: parallel-3
+    secrets:
+      - source: sonar_token
+        target: SONAR_TOKEN
+    volumes:
+      - sonar-cache:/root/.sonar/cache
+    when:
+      branch:
+        - master
+        - staging
+      status:
+        - success
+    commands:
+      - >
+        sonar-scanner
+        -Dsonar.projectName="API (${DRONE_BRANCH})"
+        -Dsonar.host.url=https://sonarqube.(snip)
+        -Dsonar.projectKey=api:${DRONE_BRANCH}
+        -Dsonar.projectVersion=$(cat VERSION)
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.projectBaseDir=.
+
+  publish:
+    image: docker
+    group: parallel-3
+    commands:
+      # Build production image, which includes the code and without xdebug.
+      - docker build . --target production -t registry.(snip)/api:latest
+      # Build the nginx proxy image.
+      - docker build ./nginx -t registry.(snip)/api-nginx:latest
+      # Publish both to the registry
+      - docker push registry.(snip)/api:latest
+      - docker push registry.(snip)/api-nginx:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    when:
+      branch:
+        - master
+      status:
+        - success
+
+  delete-build-image:
+    image: docker
+    commands:
+      # Delete the build image.
+      - docker rmi api-build:${DRONE_BUILD_NUMBER}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    when:
+      status:
+        - success
+        - failure
+
+  slack:
+    image: plugins/slack
+    webhook: https://hooks.slack.com/services/(snip)
+    channel: ci
+    when:
+      status:
+        - success
+        - failure
+
+services:
+  mysql:
+    image: mysql:5.6
+    environment:
+      - MYSQL_DATABASE=(snip)
+      - MYSQL_ROOT_PASSWORD=msyql
